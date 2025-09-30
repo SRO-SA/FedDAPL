@@ -1,0 +1,673 @@
+from multiprocessing import context
+import torch
+import torch.optim as optim
+import os
+import time
+from model import BrainCancer
+from model_feature_regress import DANN3D, BrainCancerFeaturizer, BrainCancerRegressor
+from utils import get_layer_params_list, get_layer_params_dict, flatten_layer_param_list_for_model, reconstruct_layer_from_flat
+from utils import debug_function, log_print
+import csv
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+from sklearn.decomposition import PCA
+import math
+import json
+import pandas as pd
+
+def get_num_cpus():
+    try:
+        # If inside a Ray actor context
+            ctx = ray.get_runtime_context()
+            cpu_resources = ctx.get_assigned_resources().get("CPU", 1)
+            return int(cpu_resources)
+    except Exception:
+        pass
+
+    # Fallback: use total system CPUs
+    return os.cpu_count()
+
+class Server:
+    @debug_function(context="SERVER")
+    def __init__(self, num_clients, val_dataset, test_dataset, model_type="Normal", alpha_var=0.1, beta_sparsity=0.01, run_id=None, num_rounds=10):
+        """
+        num_clients: number of clients in the federation
+        alpha_var: regularization weight for variance minimization in the M_inv block
+        beta_sparsity: regularization weight for L1 (sparsity) in the M_spec block
+        default: alpha_var=0.1, beta_sparsity=0.1
+        new 1: alpha_var=0.1, beta_sparsity=0.01
+        """
+        # hook = sy.TorchHook(torch)  # Hook PyTorch
+        self.run_id = run_id
+        self.val_dataset = val_dataset
+        self.test_dataset = test_dataset
+        self.num_clients = num_clients
+        self.alpha_var = alpha_var
+        self.beta_sparsity = beta_sparsity
+        self.num_rounds = num_rounds
+        self.best_score = -np.inf
+        self.best_layer = None
+        self.domains = []
+        num_cpus = get_num_cpus()
+        torch.set_num_threads(num_cpus)
+
+        if model_type == "Normal":
+            self.initial_dummy_model = BrainCancer()
+            self.initial_dummy_paramters_dict = get_layer_params_dict(self.initial_dummy_model)
+            self.initial_dummy_paramters_list = get_layer_params_list(self.initial_dummy_model)
+        elif model_type == "DANN3D":
+            n_domains  = 15
+            feat_net   = BrainCancerFeaturizer(use_conv5=True)  # or False for conv4
+            reg_head   = BrainCancerRegressor()
+            self.initial_dummy_model = DANN3D(feat_net, reg_head, n_domains, hidden_size=512)
+            self.initial_dummy_paramters_dict = get_layer_params_dict(self.initial_dummy_model)
+            self.initial_dummy_paramters_list = get_layer_params_list(self.initial_dummy_model)
+        self.num_layers = len(self.initial_dummy_paramters_list)
+        self.layer_slices = []            # one slice per layer
+        start = 0
+        for layer_param_list in self.initial_dummy_paramters_list:
+            layer_size = sum(p.numel() for p in layer_param_list)
+            self.layer_slices.append(slice(start, start + layer_size))
+            start += layer_size
+        # Example: layer_slices[4] points to the regressor-FC weights
+        self.M_spec_layer_wise = {}
+        self.prev_spec_global = {}  # {layer_idx: Tensor [d_l]}  for each layer
+        self.inv_agg = {}
+        self.SERVER_LOG_HEADERS = [
+            "round",
+            "layer_idx",
+            "inv_variance",
+            "spec_l1_norm",
+            "recon_loss",
+            "inv_norm",
+            "spec_norm",
+            "agg_norm",
+            "param_diversity",
+            "probe_accuracy_inv",
+            "probe_accuracy_spec",
+            "cos_to_mean",
+            "spread",
+            "angle_inv",
+            "pc1_coords"
+
+        ]
+        # self.vms = []
+        self.client_log_file_paths = []
+        # Generate a unique run directory (create if doesn't exist)
+        if self.run_id is None:
+            self.run_id = time.strftime("%Y-%m-%d_%H-%M-%S")  # Timestamp-based run ID
+        self.run_dir = os.path.join("./runs", f"run_{run_id}")  # Each run has a separate directory
+        os.makedirs(self.run_dir, exist_ok=True)
+
+        self.server_log_dir = os.path.join(self.run_dir, "server_log")
+        os.makedirs(self.server_log_dir, exist_ok=True)  # Create directory if it doesn't exist
+        self.server_log_path = os.path.join(self.server_log_dir, "server_metrics.csv")
+        self.validation_log_path = os.path.join(self.server_log_dir, "validation_metrics.txt")
+        self.sensitivity_log_path = os.path.join(self.server_log_dir, "sensitivity_metrics.csv")
+        self.winner_log_path = os.path.join(self.server_log_dir, "winner_round.csv")
+        self.text_log_path = os.path.join(self.server_log_dir, "test_metrics.txt")
+        self.initialize_server_logger()
+        # Create virtual machines for each client
+        for i in range(num_clients):
+            # self.vms[i] = sy.VirtualMachine(name="domain_{i}")
+            # self.domains[i] = self.vms[i].get_root_client()
+            # Define file path for logging
+            self.client_log_dir = os.path.join(self.run_dir, "clients_log")
+            os.makedirs(self.client_log_dir, exist_ok=True)  # Create directory if it doesn't exist
+            self.client_log_file_paths.append(os.path.join(self.client_log_dir, f"client_{i}_metrics"))
+
+        
+        # Optional: store aggregated domain-invariant params for reference
+        # { layer_index: [ aggregated_invariant_vector ] }
+        self.global_invariant_store = {}
+       
+    def initialize_server_logger(self):
+        # os.makedirs(self.server_log_dir, exist_ok=True)
+        if not os.path.exists(self.server_log_path):
+            with open(self.server_log_path, mode="w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(self.SERVER_LOG_HEADERS)
+    
+
+    def log_server_metrics(self, row_dict):
+        with open(self.server_log_path, mode="a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([row_dict[h] for h in self.SERVER_LOG_HEADERS])
+
+    def compute_thresholds(self):
+        srv = pd.read_csv(self.server_log_path)
+
+        latest_round = srv['round'].max()
+        # mean_angle_inv = srv['angle_inv'].mean()
+        # mean_spread = srv['spread'].mean()
+        window = srv[srv['round'] >= max(1, latest_round - 2)]
+
+        # Slightly relax thresholds to avoid aggressive updates
+        # dynamic thresholds
+        threshold_angle  = window['angle_inv'].mean()  * 0.95
+        threshold_spread = window['spread'].mean()     * 0.95
+
+        return threshold_angle, threshold_spread
+
+    def adapt_alpha_beta(self):
+        threshold_angle, threshold_spread = self.compute_thresholds()
+
+        srv = pd.read_csv(self.server_log_path)
+        # Focus on the latest round
+        latest_round = srv['round'].max()
+        window = srv[srv['round'] >= max(1, latest_round - 2)]
+        # latest_data = srv[srv['round'] == latest_round]
+
+        # Compute mean across layers for the latest round
+        latest_data = window[window['round'] == latest_round]
+        current_angle_inv = latest_data['angle_inv'].mean()
+        current_spread = latest_data['spread'].mean()
+
+        # # Adapt alpha_var
+        # if current_angle_inv < threshold_angle:
+        #     self.alpha_var *= 1.01  # increase invariance strength
+        # else:
+        #     self.alpha_var *= 0.99  # relax invariance slightly
+
+        # warm-up: skip first 5 rounds
+        if latest_round > 5:
+            # only increase invariance
+            if current_angle_inv < 0.8 * threshold_angle:
+                self.alpha_var = min(self.alpha_var * 1.05, 0.5)
+
+            # only decrease sparsity (i.e. allow more spread)
+            if current_spread < 0.8 * threshold_spread:
+                self.beta_sparsity = max(self.beta_sparsity * 0.95, 0.001)
+
+        # # Keep parameters within reasonable bounds
+        # self.alpha_var = min(max(self.alpha_var, 0.01), 1.0)
+        # self.beta_sparsity = min(max(self.beta_sparsity, 0.001), 0.1)
+        return 
+        # # Optionally log the adaptive changes:
+        # with open(self.server_log_dir + '/adaptive_params.csv', 'a') as f:
+        #     f.write(f"{latest_round},{self.alpha_var:.4f},{self.beta_sparsity:.4f}\n")
+
+        
+    @debug_function(context="SERVER")
+    @torch.no_grad()
+    def pc1_coords(self, M_spec):
+        # 2) separate  …  you already have  M_spec,  M_inv
+        M0 = M_spec - M_spec.mean(1, keepdim=True)      # (d, K)
+
+        # --- rank-1 SVD ---------------------------------------------------
+        # returns U (d×1), S (1,), V (K×1)
+        U, S, V = torch.svd_lowrank(M0, q=1)            # q = 1 → top component
+        pc1_scanner = V[:, 0]                           # shape (K,)
+        # scores of each scanner on PC-1  (proportional to pc1_scanner)
+        coords = (S[0] * pc1_scanner).tolist()          # same length K
+        return coords
+            
+    @debug_function(context="SERVER")    
+    def weight_space_probe_aug(self, M_block, n_aug=64, noise_std=0.02):
+        """
+        Create n_aug noisy copies of each column, then fit logistic regression.
+        """
+        d, K = M_block.shape
+        feats, labels = [], []
+        for j in range(K):
+            base = M_block[:, j]
+            for _ in range(n_aug):
+                z = base + noise_std * torch.randn_like(base)
+                feats.append(z.cpu().numpy())
+                labels.append(j)
+        X = np.vstack(feats)
+        y = np.array(labels)
+        clf = LogisticRegression(max_iter=1000, multi_class='multinomial')
+        clf.fit(X, y)
+        return clf.score(X, y)          # training==testing OK (lots of samples)
+    
+    @debug_function(context="SERVER")
+    def contrastive_loss_Mspec(self, M_spec, tau=0.07,
+                            noise_std=0.5, n_aug=32):
+        d, K = M_spec.shape
+        cols  = [M_spec[:, j] for j in range(K)]
+
+        feats, labels = [], []
+        for j, col in enumerate(cols):
+            for _ in range(n_aug):
+                z = col + noise_std * torch.randn_like(col)
+                z = torch.nn.functional.normalize(z, dim=0)
+                feats.append(z); labels.append(j)
+        X = torch.stack(feats)                         # (N, d)
+        y = torch.tensor(labels, device=X.device)
+
+        sim      = (X @ X.T) / tau                     # cosine * 1/τ
+        sim_exp  = sim.exp()
+        eye_mask = torch.eye(sim.size(0), dtype=torch.bool, device=X.device)
+        sim_exp  = sim_exp.masked_fill(eye_mask, 0.0)  # ← out-of-place
+
+        pos_mask = (y[:, None] == y[None, :]) & (~eye_mask)
+        pos_sim  = (sim_exp * pos_mask).sum(dim=1)     # numerator
+        neg_sim  = (sim_exp * (~pos_mask)).sum(dim=1)  # denominator
+        loss = -torch.log(pos_sim / (pos_sim + neg_sim + 1e-12)).mean()
+        return loss
+
+    @debug_function(context="SERVER")
+    def alpha_mix(self, M_spec: torch.Tensor, layer_idx: int, alpha: float = 0.8):
+        """
+        Blend each client's M_spec[:, j] with previous global spec.
+        - M_spec shape: [d, K]
+        - prev_spec_global[layer_idx]: shape [d]
+        - Returns: blended_spec [d, K]
+        """
+        d, K = M_spec.shape
+        if layer_idx not in self.prev_spec_global:
+            # If this is the first round, fallback to current mean
+            self.prev_spec_global[layer_idx] = M_spec.mean(dim=1).clone().detach()
+
+        global_spec = self.prev_spec_global[layer_idx].unsqueeze(1)  # [d, 1]
+        blended_spec = alpha * M_spec + (1 - alpha) * global_spec
+
+        # Update for next round: new global spec = weighted avg of current
+        self.prev_spec_global[layer_idx] = blended_spec.mean(dim=1).detach()
+
+        return blended_spec
+            
+    @debug_function(context="SERVER")
+    def gather_client_params(self, client_params_dict, layer_idx):
+        """
+        client_params_dict: { client_id: [layer0_tensor, layer1_tensor, ...] }
+        layer_idx: which layer to gather
+
+        Returns a matrix param_matrix of shape (d_layer, K), where d_layer is 
+        the flattened dimension of this layer, K = num_clients.
+        """
+        # for client_id, layer_params in client_params_dict.items():
+        #     log_print(f"[DEBUG] Client {client_id} → Layer {layer_idx} total layers: {len(layer_params)}")
+        #     for i, layer in enumerate(layer_params):
+        #         log_print(f"[DEBUG] Client {client_id} → Layer {i}  len: {len(layer)}, len item 1: {len(layer[0])}, len item 2: {len(layer[1])}")
+        param_list = []
+        for client_id, layer_params in client_params_dict.items():
+            flattened_tensor = torch.cat([
+                p.view(-1) for p in layer_params[layer_idx]  # flatten each tensor in layer
+            ])            # layer_tensor = param_layer_flatten[layer_idx]      # flatten
+            # log_print(f"[DEBUG] Client {client_id} → Layer {layer_idx} param shape after flatten: {len(flattened_tensor)}", context="GATHER CLIENT PARAMS")
+            param_list.append(flattened_tensor)
+        
+        if not param_list:
+            raise ValueError(f"[ERROR] Empty param_list for layer {layer_idx}. client_params_dict keys: {list(client_params_dict.keys())}")
+        # Stack all columns => shape (d_layer, K)
+        # for i, p in enumerate(param_list):
+        #     log_print(f"[DEBUG] {i}th param_list shape: {len(p)}")
+        #     log_print(f"param[{i}] flattened size = {[t.numel() for t in p]}")
+        #     log_print(f"total flattened vector size = {sum(t.numel() for t in p)}") 
+        param_matrix = torch.stack(param_list, dim=1)
+        return param_matrix
+    
+    @debug_function(context="SERVER")
+    def separate_inv_spec_soft(self, param_matrix):
+        """
+        Given param_matrix of shape [d, K], we want to decompose it into:
+          M_inv + M_spec = param_matrix
+        using a "soft" approach with:
+          - Low variance penalty on M_inv across columns 
+          - L1 (sparsity) penalty on M_spec
+        """
+        # log_print(f"[DEBUG] param_matrix shape: {param_matrix.shape}", context="SEPARATE INV SPEC")
+        param_matrix = param_matrix.detach()  # shape (d, K)
+        d, K = param_matrix.shape
+
+        # Initialize M_inv as the column-average repeated across columns
+        col_avg = param_matrix.mean(dim=1, keepdim=True)  # shape (d,1)
+        M_inv = col_avg.repeat(1, K).detach().clone().requires_grad_(True)  # (d,K)
+        # M_spec is the difference
+        M_spec = (param_matrix - M_inv).detach().clone().requires_grad_(True)
+        
+        optimizer = optim.Adam([M_inv, M_spec], lr=0.01, betas=(0.9, 0.999))
+
+        for _ in range(30):
+            optimizer.zero_grad()
+
+            recon = M_inv + M_spec
+            loss_recon = (recon - param_matrix).pow(2).mean()
+
+            # Variance across columns => domain invariance
+            var_cols = M_inv.var(dim=1)   # shape (d,)
+            loss_var = var_cols.mean()    # mean variance across d
+
+            # L1 sparsity on domain-specific block
+            loss_l1 = M_spec.abs().sum() / d*K
+
+            # AFTER you compute loss_l1
+            loss_contrast = self.contrastive_loss_Mspec(M_spec, tau=0.07,
+                                                        noise_std=0.02, n_aug=32)
+
+            lambda_c = 0.2                               # new hyper‑parameter
+            loss = (loss_recon
+                    + self.alpha_var * loss_var
+                    + self.beta_sparsity * loss_l1
+                    + lambda_c * loss_contrast)          # <── added            # quick probe inside the separation loop
+            if _ % 10 == 0:
+                log_print(_, loss_recon.item(),
+                        (self.alpha_var * loss_var).item(),
+                        (self.beta_sparsity * loss_l1).item(), context="SEPARATE INV SPEC")
+            loss.backward()
+            optimizer.step()
+
+        return M_inv.detach(), M_spec.detach(), {"loss_var": loss_var, "loss_l1": loss_l1, "loss_recon": loss_recon}
+
+    @debug_function(context="SERVER")
+    def aggregate_invariant(self, M_inv, client_weights=None):
+        """
+        Weighted column-wise average of M_inv => shape (d,).
+        This is the global domain-invariant parameter vector for that layer.
+        """
+        d, K = M_inv.shape
+        if client_weights is None:
+            # default: uniform weighting
+            client_weights = [1.0 / K] * K
+        else:
+            # Normalize weights
+            total_weight = sum(client_weights)
+            client_weights = [w / total_weight for w in client_weights]
+        inv_agg = torch.zeros(d)
+        for j in range(K):
+            inv_agg += client_weights[j] * M_inv[:, j]
+        return inv_agg
+
+    @debug_function(context="SERVER")
+    def server_round(self, client_params_dict, num_layers, server_round, client_weights=None):
+        """
+        For each layer:
+          1) gather param_matrix (d_l, K)
+          2) separate into domain-inv M_inv, domain-spec M_spec
+          3) aggregate M_inv across columns -> inv_agg
+          4) reconstruct new layer for each client: new_layer = inv_agg + M_spec[:, client_j]
+        Return updated_client_params => {cid: [layer0, layer1, ...]}
+        """
+        # for cid in client_params_dict:
+        #     log_print(f"[SERVER ROUND] Client {cid} params: {len(client_params_dict[cid])}")
+        updated_client_params = {cid: [] for cid in client_params_dict}
+        
+        for layer_idx in range(num_layers):
+            # 1) gather
+            param_matrix = self.gather_client_params(client_params_dict, layer_idx)
+
+            # 2) separate
+            M_inv, M_spec, metric_dict = self.separate_inv_spec_soft(param_matrix)
+            
+            coords = self.pc1_coords(M_spec)  # PC-1 coordinates for this layer
+            # inside server_round, after separation
+            acc_spec = self.weight_space_probe_aug(M_spec)
+            acc_inv  = self.weight_space_probe_aug(M_inv)
+            cos_to_mean = torch.cosine_similarity(M_spec.mean(1),  # mean column
+                                                M_spec[:,0], dim=0)
+            spread      = (M_spec - M_spec.mean(1,keepdim=True)).norm(dim=0).mean()
+            angle_inv   = torch.acos( torch.clamp(
+                            (M_inv * M_spec).sum() /
+                            (M_inv.norm() * M_spec.norm()), -1+1e-6, 1-1e-6) )
+
+            # log_print(f"probe-acc spec={acc_spec:.2%}, inv={acc_inv:.2%}")
+            # 3) aggregate domain-invariant
+            inv_agg = self.aggregate_invariant(M_inv, client_weights)
+            
+            self.M_spec_layer_wise[layer_idx] = M_spec.clone()  # Store M_spec for reference
+            self.inv_agg[layer_idx] = inv_agg.clone()  # Store inv_agg for reference
+
+            # 4) apply alpha-mix
+            blended_spec = self.alpha_mix(M_spec, layer_idx, alpha=0.8)
+            # 4) form new layer for each client
+            d_l, K = param_matrix.shape
+            all_client_ids = list(client_params_dict.keys())
+            for j, cid in enumerate(all_client_ids):
+                # The new layer is the sum of the aggregated invariant part
+                # plus the local domain-specific offset
+                new_layer_flat = inv_agg + blended_spec[:, j]
+                # shape is (d_l,) flattened => we can reshape if needed
+                # For demonstration, we'll keep them flattened in param_struct:
+                # Get the structure of the layer from client input
+                reference_layer = client_params_dict[cid][layer_idx]  # List[Tensor]
+                new_layer_reshaped = reconstruct_layer_from_flat(new_layer_flat, reference_layer)
+
+                updated_client_params[cid].append(new_layer_reshaped)  # append structured layer
+
+            # Optionally store the aggregated invariant for reference
+            self.global_invariant_store[layer_idx] = new_layer_flat.clone()
+            self.log_server_metrics({
+                "round": server_round,
+                "layer_idx": layer_idx,
+                "inv_variance": float(metric_dict["loss_var"].item()),
+                "spec_l1_norm": float(metric_dict["loss_l1"].item()),
+                "recon_loss": float(metric_dict["loss_recon"].item()),
+                "inv_norm": float(M_inv.norm().item()),
+                "spec_norm": float(M_spec.norm().item()),
+                "agg_norm": float(inv_agg.norm().item()),
+                "param_diversity": float(torch.std(param_matrix, dim=1).mean().item()),
+                "probe_accuracy_inv": float(acc_inv),
+                "probe_accuracy_spec": float(acc_spec),
+                "cos_to_mean": float(cos_to_mean.item()),
+                "spread": float(spread.item()),
+                "angle_inv": float(angle_inv.item()),
+                "pc1_coords": json.dumps(coords)   # import json at top
+            })
+            # end of your server_round function (after logging)
+            self.adapt_alpha_beta()
+        return updated_client_params
+
+
+
+
+
+
+
+class ServerDomainSpecHelper:
+    def __init__(self, server_obj: Server):
+        self.server = server_obj
+    
+    def get_best_layer_idx(self):
+        """
+        Returns the index of the layer with the best validation score.
+        """
+        srv = pd.read_csv(self.server.server_log_path)
+        layer_scores = {}
+        for layer_idx in range(self.server.num_layers):
+            layer_data = srv[srv.layer_idx == layer_idx]
+            spread_avg = layer_data['spread'].mean()
+            angle_inv_avg = layer_data['angle_inv'].mean()
+            layer_scores[layer_idx] = spread_avg * angle_inv_avg
+
+        best_layer = max(layer_scores, key=layer_scores.get)
+        best_score = layer_scores[best_layer]
+        return best_layer, best_score
+
+    
+    @debug_function(context="SERVER DOMAIN SPEC")
+    def convert_M_spec_layers_to_clients(self, M_spec_dict):
+        """
+        Convert {layer_idx: M_spec_l [d_l, K]} → list of client vectors [M_spec_client1, ..., M_spec_clientK]
+        """
+        num_clients = self.server.num_clients
+        client_specs = []
+
+        for client_idx in range(num_clients):
+            client_vector_parts = []
+            for layer_idx in sorted(M_spec_dict.keys()):
+                M_spec_layer = M_spec_dict[layer_idx]  # shape [d_l, K]
+                M_spec_client_l = M_spec_layer[:, client_idx]  # shape [d_l]
+                client_vector_parts.append(M_spec_client_l)
+            # Flatten across all layers
+            M_spec_client = torch.cat(client_vector_parts)
+            client_specs.append(M_spec_client)
+
+        return client_specs
+    
+    @debug_function(context="SERVER DOMAIN SPEC")
+    def compute_spec_distribution(self, M_spec_list):
+        """
+        M_spec_list: List of domain-specific parameter tensors from trained domains.
+                    Each tensor shape: [d] (flattened)
+        """
+        stacked_spec = torch.stack(M_spec_list)  # shape: [num_domains, d]
+        spec_mean = stacked_spec.mean(dim=0)
+        spec_std = stacked_spec.std(dim=0) + 1e-6  # small epsilon to avoid zero variance
+        return spec_mean, spec_std
+        # Example usage after federated training:
+        # M_spec_list = [M_spec_client1.flatten(), M_spec_client2.flatten(), ..., M_spec_clientK.flatten()]
+        # spec_mean, spec_std = compute_spec_distribution(M_spec_list)
+    
+    @debug_function(context="SERVER DOMAIN SPEC")
+    def initialize_new_domain_spec(self, spec_mean, spec_std):
+        """
+        Initialize new domain-specific parameters from learned distribution.
+        """
+        new_spec = torch.normal(mean=spec_mean, std=spec_std)
+        return new_spec
+
+        # Usage:
+        # new_M_spec = initialize_new_domain_spec(spec_mean, spec_std)
+        # print(new_M_spec.shape)  # [d]
+        
+    @torch.no_grad()
+    def sample_mahalanobis(self, M_spec_list, epsilon=1.0):
+        """
+        Return a brand-new spec that is ε-far (Mahalanobis) from the mean,
+        but still lies in the training ellipsoid.
+        """
+        X   = torch.stack(M_spec_list)              # (K, d)
+        mu  = X.mean(0)
+        cov = torch.cov(X.T) + 1e-6*torch.eye(X.size(1), device=X.device)
+        L   = torch.linalg.cholesky(cov)
+
+        unit = torch.randn_like(mu)
+        unit = unit / unit.norm()                   # random direction
+        new  = mu + L @ unit * epsilon
+        return new
+    
+    @torch.no_grad()
+    def sample_mahalanobis_lowrank(self, M_spec_list, epsilon=1.0):
+        """
+        Low-rank Mahalanobis sampler (rank ≤ K-1).
+        spec_list : list of K tensors, each shape (d,)
+        epsilon   : radius multiplier (0.3–0.6 recommended)
+
+        Returns
+        -------
+        new_spec  : tensor (d,)
+        """
+        X = torch.stack(M_spec_list)           # (K, d)
+        mu = X.mean(0)
+        Xc = (X - mu).T                      # (d, K)
+        K  = Xc.shape[1]
+
+        G  = (Xc.T @ Xc) / (K-1)             # (K, K)  tiny
+        eigval, V = torch.linalg.eigh(G)     # eigval ascending
+        eigval = eigval.clamp_min(1e-9)      # numerical safety
+        # Lam_inv_sqrt = torch.diag(eigval.rsqrt())
+        Lam_sqrt  = torch.diag(eigval.sqrt())  # √Λ   <-- **square-root**, not inverse
+
+        # random direction on K-sphere
+        w = torch.randn(K, device=X.device)
+        w = epsilon * w / w.norm()
+
+        delta = (Xc @ (V @ (Lam_sqrt @ w))) / math.sqrt(K - 1)
+        new = mu + delta
+        return new
+    
+    @torch.no_grad()
+    def sample_lowrank_clip(self, M_spec_list, frac=0.6):
+        new = self.sample_mahalanobis_lowrank(M_spec_list, epsilon=1.0)  # any ε
+        mu  = torch.stack(M_spec_list).mean(0)
+        Xc  = torch.stack(M_spec_list) - mu
+        rms = torch.sqrt((Xc**2).sum() / (len(M_spec_list)-1)).item()  # √trace
+        delta = new - mu
+        target = frac * rms                        # e.g. 0.6× training rms
+        new = mu + delta * (target / delta.norm()) # clip radius
+        return new
+    
+    @torch.no_grad()
+    def sample_mahalanobis_diag(self, M_spec_list, epsilon=1.0):
+        X   = torch.stack(M_spec_list)          # (K, d)
+        mu  = X.mean(0)
+        std = X.std(0) + 1e-6                # diag Σ½
+        z   = torch.randn_like(mu)
+        z   = z / z.norm()                   # unit direction
+        new = mu + epsilon * std * z         # ε-far in diag metric
+        return new
+    
+    @torch.no_grad()
+    def sample_dirichlet(self, spec_list, alpha=0.3):
+        K = len(spec_list)
+        w = torch.distributions.dirichlet.Dirichlet(alpha * torch.ones(K)).sample()
+        new = torch.stack(spec_list).T @ w        # convex combo
+        return new
+    
+    @torch.no_grad()
+    def sample_layer4_pc(self, spec_list, frac=0.4):
+        """
+        Move along the top-1 PC of layer-4 (index=4) by
+        `frac` × training std in that direction.
+        """
+        layer4 = self.server.layer_slices[4]
+        # stack only the layer-4 part of every client spec (all rounds)
+        X = torch.stack([s[layer4] for s in spec_list])      # (K, d4)
+        mu4 = X.mean(0)
+        # PCA on CPU numpy
+        pc1 = PCA(n_components=1).fit(X.cpu().numpy()).components_[0]
+        pc1 = torch.tensor(pc1, device=X.device, dtype=X.dtype)
+        pc1 = pc1 / pc1.norm()                               # unit vector
+
+        std1 = X.sub(mu4).matmul(pc1).std()                  # std along PC-1
+
+        new_flat = mu4 + frac * std1 * pc1                   # move 0.4·σ
+        # --------------------------------------------------------------
+        # Build full spec vector: layer-4 gets new_flat, others = mean
+        # --------------------------------------------------------------
+        spec_mean_flat = torch.stack(spec_list).mean(0)      # (d,)
+        out = spec_mean_flat.clone()
+        out[layer4] = new_flat
+        return out
+    
+    @torch.no_grad()
+    def sample_bestlayer_dirichlet(self, spec_list, layer_idx, alpha=[1.5,1.5,1.5]):
+        layer_slice = self.server.layer_slices[layer_idx]
+        X = torch.stack([s[layer_slice] for s in spec_list])
+        mu = X.mean(0)
+
+        # Low‐rank SVD to get U ∈ ℝ^(K×1), S ∈ ℝ^1, V ∈ ℝ^(d_l×1)
+        U, S, V = torch.svd_lowrank(X - mu[None], q=1)
+        # U[:,0] are the PC1 *scores* for each of the K clients
+        pc1 = U[:, 0]                             # length K
+
+        pc1_dist = torch.abs(pc1 - pc1.mean()).abs()
+        idx_top3 = pc1_dist.topk(3, largest=False).indices  # tensor length 3
+
+
+        w = torch.distributions.Dirichlet(torch.tensor(alpha)).sample().to(X.device)
+
+        new_flat = sum(w[i] * spec_list[int(idx_top3[i])] for i in range(3))
+
+        return new_flat
+
+    
+    def layer_grad_norms(self, model, val_loader, layer_param_groups,
+                        n_batches=2, device="cpu"):
+        norms = [0.0] * len(layer_param_groups)
+        criterion = torch.nn.MSELoss()
+
+        it = iter(val_loader)
+        for _ in range(n_batches):
+            try:
+                xb, yb = next(it)[:2]           # works for (x,y) or (x,y,meta)
+            except StopIteration:
+                break
+
+            xb, yb = xb.to(device), yb.to(device)
+            loss = criterion(model(xb.float()), yb.squeeze(1))
+
+            model.zero_grad(set_to_none=True)
+            loss.backward()
+
+            # accumulate grad-norms per layer
+            for j, plist in enumerate(layer_param_groups):
+                layer_norm_sq = 0.0
+                for p in plist:
+                    if p.grad is not None:
+                        layer_norm_sq += p.grad.norm().item() ** 2
+                norms[j] += math.sqrt(layer_norm_sq)
+
+        return [n / max(1, n_batches) for n in norms]

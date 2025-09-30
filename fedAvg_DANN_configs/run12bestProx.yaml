@@ -1,0 +1,13 @@
+# Hyperparams that used to be hard-coded in client.py
+# Current Best Reported
+d_lr: 0.0010
+lr: 0.0006
+grl_coeff: 8.5
+smooth_eps: 0.06
+mu_global: 40
+ProxAll: True
+UseAdam: False
+
+# (optional) things you already pass
+# batch_size: 16
+# epochs: 5

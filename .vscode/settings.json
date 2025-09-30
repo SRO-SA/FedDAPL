@@ -1,0 +1,8 @@
+{
+    "python.defaultInterpreterPath": "/rhome/ssafa013/bigdata/.conda/envs/syft_env/bin/python",
+    "python.experiments.enabled": false,
+    "python.analysis.logLevel": "Trace",
+    "python.testing.cwd": "${workspaceFolder}",
+    "python.REPL.enableREPLSmartSend": false
+
+}

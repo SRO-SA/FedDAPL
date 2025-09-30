@@ -1,0 +1,5 @@
+
+# (optional) things you already pass
+batch_size: 16
+epochs: 5
+device: "cuda"
